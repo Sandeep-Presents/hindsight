@@ -13,6 +13,7 @@ Requires: python-oracledb (thin mode — pure Python, no Oracle client needed).
 Supports multi-tenant schema isolation via ALTER SESSION SET CURRENT_SCHEMA.
 """
 
+import array
 import datetime
 import inspect
 import json
@@ -86,6 +87,14 @@ _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both
 # column group must accept the quoted form too — same shape as the arrow regex above.
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
+# Parameters that carry an embedding: the query-side operand of VECTOR_DISTANCE(<column>, :N, ...),
+# bare or wrapped in TO_VECTOR (which accepts a native VECTOR bind too), and values written to an
+# embedding column (SET embedding = :N, or INSERT column/value lists).
+_VECTOR_DISTANCE_PARAM_RE = re.compile(r"VECTOR_DISTANCE\(\s*[\w.\"]+\s*,\s*(?:TO_VECTOR\(\s*)?:(\w+)", re.IGNORECASE)
+_EMBEDDING_ASSIGN_PARAM_RE = re.compile(r"\bembedding\s*=\s*:(\w+)", re.IGNORECASE)
+_INSERT_COLUMNS_VALUES_RE = re.compile(
+    r"INSERT\s+INTO\s+[\w.\"]+\s*\(([^()]*)\)\s*VALUES\s*\((.*)\)", re.IGNORECASE | re.DOTALL
+)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -508,25 +517,29 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
                 flags=re.IGNORECASE,
             )
     else:
-        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax
+        # No FOR UPDATE: use standard FETCH FIRST / OFFSET ROWS syntax.
+        # A query ranking by vector distance asks for EXACT: on Autonomous Database a bare
+        # FETCH FIRST is answered from a vector index whenever one exists, which made these
+        # nearest-neighbour lookups (temporal arm, link expansion) silently approximate.
+        fetch_first = "FETCH EXACT FIRST" if "VECTOR_DISTANCE(" in query else "FETCH FIRST"
         # First handle "LIMIT N OFFSET M" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\s+OFFSET\s+(\d+|:\w+)\b",
-            r"OFFSET \2 ROWS FETCH FIRST \1 ROWS ONLY",
+            rf"OFFSET \2 ROWS {fetch_first} \1 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
         # Handle "OFFSET M LIMIT N" → "OFFSET M ROWS FETCH FIRST N ROWS ONLY"
         query = re.sub(
             r"\bOFFSET\s+(\d+|:\w+)\s+LIMIT\s+(\d+|:\w+)\b",
-            r"OFFSET \1 ROWS FETCH FIRST \2 ROWS ONLY",
+            rf"OFFSET \1 ROWS {fetch_first} \2 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
         # Handle standalone "LIMIT N" (no OFFSET)
         query = re.sub(
             r"\bLIMIT\s+(\d+|:\w+)\b",
-            r"FETCH FIRST \1 ROWS ONLY",
+            rf"{fetch_first} \1 ROWS ONLY",
             query,
             flags=re.IGNORECASE,
         )
@@ -798,6 +811,35 @@ class OracleConnection(DatabaseConnection):
         return params
 
     @staticmethod
+    def _bind_vectors_natively(query: str, params: dict[str, Any] | None) -> None:
+        """Bind embedding parameters as native vectors instead of text.
+
+        Callers pass embeddings as their str() — "[0.0123, ...]" — which bind as text. Oracle
+        converts text to VECTOR through a 32,767-byte buffer, and str() of a 1536-dimension
+        embedding with full-precision floats is ~33 KB: recall failed with ORA-01460 and
+        writes (e.g. consolidation inserting an observation) with ORA-01461 for such
+        providers, and always at 3072 dimensions. An array('f') binds as DB_TYPE_VECTOR with
+        no size limit; the columns are FLOAT32, so nothing is lost. Only parameters used as
+        an embedding are converted (VECTOR_DISTANCE operand or a value of the embedding
+        column); other JSON-looking parameters keep their text binding.
+        """
+        if not params:
+            return
+        keys = set(_VECTOR_DISTANCE_PARAM_RE.findall(query)) | set(_EMBEDDING_ASSIGN_PARAM_RE.findall(query))
+        # INSERT INTO t (..., embedding, ...) VALUES (..., :N, ...): pair the lists by position.
+        insert = _INSERT_COLUMNS_VALUES_RE.search(query)
+        if insert:
+            columns = [c.strip().strip('"').lower() for c in insert.group(1).split(",")]
+            values = [v.strip() for v in _split_respecting_parens(insert.group(2))]
+            for column, value in zip(columns, values, strict=False):
+                if column == "embedding" and value.startswith(":"):
+                    keys.add(value[1:])
+        for key in keys:
+            value = params.get(key)
+            if isinstance(value, str) and value.startswith("["):
+                params[key] = array.array("f", json.loads(value))
+
+    @staticmethod
     def _apply_clob_input_sizes(cursor: Any, query: str, params: dict[str, Any] | None) -> None:
         """Tell oracledb to bind typed input sizes for ambiguous parameters.
 
@@ -1058,6 +1100,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1160,6 +1203,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1200,6 +1244,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1240,6 +1285,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            self._bind_vectors_natively(query, params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1324,9 +1370,12 @@ class OracleBackend(DatabaseBackend):
 
     def run_migrations(self, dsn: str, *, schema: str | None = None) -> None:
         """Run Oracle DDL migrations through the shared Alembic pipeline."""
+        from ...config import get_config
         from ...migrations import run_migrations
 
-        run_migrations(dsn, schema=schema)
+        # Forward the migration URL like the PostgreSQL backend does: it lets the DDL run as
+        # the schema owner while the API itself connects as a runtime user without DDL rights.
+        run_migrations(dsn, schema=schema, migration_database_url=get_config().migration_database_url)
 
     def create_task_backend(self, *, pool_getter: Any = None, schema_getter: Any = None) -> Any:
         """Oracle now uses BrokerTaskBackend — worker/poller is backend-agnostic."""
